@@ -387,15 +387,25 @@ def temp_imp(df_OB, interval, max_vol):
     while unit < end:
         times.append(unit)
         unit+=interval
-    V_mkt_orders = []
 
-    for i in range(int(max_vol*0.1), max_vol+1, int(max_vol*0.05)):
-        V_mkt_orders.append(i)
     k_i = []
     
+    V_mkt_orders = []
+
+    bid_cols = [col for col in df_OB.columns if 'Bid Size' in col]
+    max_vol_series = df_OB.groupby('Time')[bid_cols].sum()
+
     for i in times:
         ex_cost_i = []
         
+        
+        if not max_vol:
+            max_vol = int(max_vol_series.loc[i].sum())
+        
+        
+        for j in range(int(max_vol*0.1), max_vol+1, int(max_vol*0.05)):
+            V_mkt_orders.append(j)
+
         for v in V_mkt_orders:
             
             counter=1
@@ -537,10 +547,10 @@ def new_LOB_f(df_OB, levels, interval, times):
             column_name_p = f'Bid Price{v}'
             column_name_v = f'Bid Size{v}'
             
-            df_p = df_OB[['Time', 'Bid Price'+str(v)]][(df_OB['Time'] >= i) & (df_OB['Time'] <= i+interval)]              
+            df_p = df_OB[['Time', 'Bid Price'+str(v)]][(df_OB['Time'] > i) & (df_OB['Time'] <= i+interval)]              
             Pbar_i = time_weighting(df_p, column_name_p, interval)
         
-            df_v = df_OB[['Time', 'Bid Size'+str(v)]][(df_OB['Time'] >= i) & (df_OB['Time'] <= i+interval)]              
+            df_v = df_OB[['Time', 'Bid Size'+str(v)]][(df_OB['Time'] > i) & (df_OB['Time'] <= i+interval)]              
             Vbar_i = time_weighting(df_v, column_name_v, interval)
         
             level_couple = {Pbar_i: Vbar_i}
@@ -639,8 +649,8 @@ def glas_temp_imp(df_OB, max_vol, interval=3e11):
     plt.plot(x, ypred, color='red', label='Fitting')
     #plt.ylim(0, 8000)
     plt.xlabel('Time (ns. from midnight)')
-    plt.ylabel('Temporary impact')
-    plt.title('Plot temp. imp. as function of time')
+    plt.ylabel('Temporary impact (')
+    plt.title('Temp. imp. as function of time')
     plt.legend()
     plt.grid(True)
     plt.show()
@@ -1049,3 +1059,178 @@ def Sim_OptEx_ZI(l_rate, m_rate, c_rate, avg_vol = 200, m0 = 0, K = 100, iterati
         i += 1
     
     return X_CJ, S_CJ, nu_CJ, Q_CJ, Q_AC, C_CJ
+
+
+def Sim_NaiveEx_Ratio(f_lo, f_mo, f_c, alpha, sigma, lo_placement, lo_volume, mo_volume, 
+            delta, m0 = 0, K = 100, iterations = 10_000, burn = 5_000, n_tot = 100,
+            energy = False, hurst = None, lam=12000, T = 1, inv0 = 0.5*6000, Ndt=60, sign = -1):
+    
+    # setting the parameters for the optimal strategy
+    dt = 1/Ndt
+    t = np.arange(0, T+0.00000001, dt)
+    tau = T-t
+    
+    mu = np.full(Ndt+1, np.nan)  # Order Flow matrix
+    # Initializing variables for simulation base on computed strategy
+    X_n = np.full(Ndt+1, np.nan)  # Cost matrix of Strategy
+    Q_n= np.full(Ndt+1, np.nan)  # Inventory matrix
+    S_n = np.full(Ndt+1, np.nan)  # Execution Price matrix
+    nu_n = np.full(Ndt+1, np.nan)  # Rate of Trading matrix      
+    Q_AC = np.full(Ndt+1, np.nan)  # Inventory matrix, required by optimal_strategy()
+    C_n = np.full(Ndt+1, np.nan)   #  Cost vector of the strategy
+    
+    Q_n[0] = Q_AC[0] = inv0
+    mu[0] = 0
+    X_n[0] = 0 
+    C_n[0] = 0
+    
+    def ex_time(lam):
+        """
+        in seconds
+        """
+        events = np.random.poisson(lam)
+        event_time = (60*60) / events
+        return event_time
+    
+    
+    # Inizilizzo lob, vol_lob e i dizioniari dei messagi e dello stato del book
+    lob = np.zeros(K, dtype = np.int16)
+    lob[int(K//2 - n_tot//2):K//2] = 1
+    lob[K//2:int(K//2 + n_tot //2)] = -1
+
+    vol_lob = np.zeros((20,K), dtype = np.int16)
+    vol_lob[0, int(K//2 - n_tot//2):K//2] = 1
+    vol_lob[0, K//2:int(K//2 + n_tot //2)] = -1
+
+    order, message = ZI.initialize_order_message(iterations)
+    # Simulo il segno dei MO utilizzando un il rumore di un processo gaussiano
+    # frazionario avente esponente di hurst fissato in input.
+    # Se in input non viene dato un esponente il segno dei MO ÃƒÂ¨ scelto casualmente.
+    if hurst is None:
+        mo_s = None
+        mo_n = None
+    else:
+        mo_s = np.sign(fgn(n=iterations//10, hurst=hurst, length=1, method='daviesharte'))
+        mo_n = 0
+    # Simulo il LOB scartando le prime iterazioni
+    for i in range(burn):
+        MTY_vol.do_order(lob, vol_lob, f_lo, f_mo, f_c, lo_placement, lo_volume, mo_volume,
+                    delta, K, alpha, sigma, energy)
+        
+    clock_time = 0
+    
+    # Simulo il LOB
+    while clock_time <= 60*60:
+        
+        i = 0
+        event_time = ex_time(lam)
+        clock_time += event_time
+        
+        # Simulo un ordine e aggiorno i dizionari dei messaggi e dello stato del LOB
+        message["Price"][i], message["Sign"][i], message["Type"][i], \
+        message["Volume"][i], mo_n = MTY_vol.do_order(lob, vol_lob, f_lo, f_mo, f_c, lo_placement,
+                    lo_volume, mo_volume, delta, K, alpha, sigma, energy, mo_s, mo_n)
+        
+        message['Price'][i] + m0
+        message["Spread"][i] = ZI.find_spread(lob)
+        message["MidPrice"][i] = ZI.find_mid_price(lob) + m0
+
+        MTY_vol.update_order(lob, order, i, m0)
+        
+        i += 1
+    S_n[0] = message['Price'][-1]
+    clock_time = 0
+    next_volume = 0
+    
+    print('Inizio opt. ex.')
+    for t in range(len(tau)-1):
+        event_time = ex_time(lam)
+        clock_time += event_time
+        while clock_time < 60*60/Ndt:
+            
+            event_time = ex_time(lam)
+            clock_time += event_time
+        
+            # Simulo un ordine e aggiorno i dizionari dei messaggi e dello stato del LOB
+            message["Price"][i], message["Sign"][i], message["Type"][i], \
+            message["Volume"][i], mo_n = MTY_vol.do_order(lob, vol_lob, f_lo, f_mo, f_c, lo_placement,
+                        lo_volume, mo_volume, delta, K, alpha, sigma, energy, mo_s, mo_n)
+
+            message["Spread"][i] = ZI.find_spread(lob)
+            message["MidPrice"][i] = ZI.find_mid_price(lob) + m0
+
+            MTY_vol.update_order(lob, order, i, m0)
+            
+            i += 1
+            
+        clock_time = 0
+    
+        volume = inv0/Ndt
+        nu = volume/dt
+        print('nu: ', nu)
+        volume = inv0/Ndt + next_volume
+        nu_n[t] = nu
+        #print('array dei nu: ', nu_CJ)
+        print('volume: ', volume)
+        price = MTY_vol.do_market_order(lob, sign) 
+        
+        S_n[t+1] = price + m0
+        message['Price'][i] = price + m0
+        message['Sign'][i] = sign
+        message['Type'][i] = 1
+        message['Volume'][i] = volume
+        
+        message["Spread"][i] = ZI.find_spread(lob)
+        message["MidPrice"][i] = ZI.find_mid_price(lob) + m0
+        
+        dQ_n = Q_n[t]
+        dQ_AC = Q_AC[t]
+        dX_n = 0
+        dC_n = 0
+        
+        ideal_ex = volume * (price+m0)
+        
+        # FinchÃƒÂ© il volume del MO ÃƒÂ¨ maggiore del volume al best price
+        # consuma tutto il best price e passa alla quota successiva.
+        
+        print("price: ", price+m0)
+        
+        while np.abs(lob[price]) < volume:
+            try:
+                print('inside while loop, volume at best: ', lob[price])
+                dX_n += lob[price]*(price+m0)
+                print('dX_n: ', dX_n)
+                dQ_n -= lob[price]
+                dQ_AC -= lob[price]
+                
+                to_remove = np.abs(lob[price])
+                volume -= to_remove
+                print("volume: ", volume)
+                lob[price] = 0
+                MTY_vol.do_mo_queue(vol_lob, price, to_remove, sign)
+                price = MTY_vol.do_market_order(lob, sign)
+                print('new price: ', price+m0)
+                print('remaining volume: ', volume)
+                next_volume = 0
+                
+            except:
+                next_volume = volume
+                
+        
+        dQ_n -= volume
+        dQ_AC -= volume
+        dX_n += volume * (price+m0)
+        dC_n = (-sign)*ideal_ex + sign*dX_n
+        
+        print('dX_n: ', dX_n)
+        Q_n[t+1] = dQ_n
+        Q_AC[t+1] = dQ_AC
+        X_n[t+1] = dX_n
+        C_n[t+1] = dC_n
+        
+        lob[price] += volume * sign
+        MTY_vol.do_mo_queue(vol_lob, price, volume, sign)
+        
+        i += 1
+    
+    return X_n, S_n, nu_n, Q_n, C_n
